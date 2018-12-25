@@ -1,0 +1,75 @@
+#!/bin/bash
+
+set -x
+
+TOOL_DIR=/opt/home
+
+logger 'init shadowsocks'
+
+# Loading ipset modules
+#lsmod | grep "ipt_set" > /dev/null 2>&1 || \
+#for module in ip_set ip_set_iptreemap ipt_set; do
+#    insmod $module
+#done
+
+# Different routers got different iptables syntax
+case $(uname -m) in
+  armv7l)
+    MATCH_SET='--match-set'
+    ;;
+  mips)
+    MATCH_SET='--set'
+    ;;
+  aarch64)
+    MATCH_SET='--match-set'
+    ;;
+esac
+
+if [ "$(ipset swap china china 2>&1 | grep 'does not exist')" != "" ]; then
+  ipset restore < $TOOL_DIR/ipset.conf
+fi
+
+locale="bitmart1 bitmart2 bitmart3 bitmart4"
+
+# prepare iptable chain
+iptables -t nat -N SHADOWSOCKS
+
+SS_REDIR_LISTEN_ADDR=0.0.0.0
+SS_REDIR_LISTEN_PORT_BEGIN=10000
+SS_REDIR_LISTEN_PORT_COUNT=0
+#KCPTUN_ADDR=127.0.0.1
+#KCPTUN_PORT=4000
+for l in ${locale}; do
+
+  conf_file=/jffs/shadowsocks/${l}.json
+  remote_addr=`sed -n ${conf_file} -e 's/.*\"server\":\"\?\([0-9.]\+\)\"\?,.*$/\1/p'`
+  remote_port=`sed -n ${conf_file} -e 's/.*\"server_port\":\"\?\([0-9]\+\)\"\?,.*$/\1/p'`
+
+  #kcp_conf_file=/jffs/kcptun/${l}.json
+  #kcp_remote_str=`sed -n ${kcp_conf_file} -e 's/.*\"remoteaddr\":\"\?\([0-9.:]\+\)\"\?,.*$/\1/p'`
+  #kcp_remote_addr=${kcp_remote_str%%:*}
+  #kcp_remote_port=${kcp_remote_str##*:}
+
+  # skip safe ssh port
+  iptables -t nat -A SHADOWSOCKS -d ${remote_addr} -p tcp --dport 24689 -j RETURN
+  iptables -t nat -A SHADOWSOCKS -d ${remote_addr} -p tcp --dport ${remote_port} -j RETURN
+  # Anything else should be redirected to shadowsocks's local port
+  #iptables -t nat -A SHADOWSOCKS -d ${remote_addr} -p tcp --dport ${remote_port} -j DNAT --to-destination ${KCPTUN_ADDR}:${KCPTUN_PORT}
+  SS_REDIR_LISTEN_PORT_COUNT=$((SS_REDIR_LISTEN_PORT_COUNT+1))
+done
+
+# apply the rules
+iptables -t nat -A PREROUTING -p tcp -j SHADOWSOCKS
+#iptables -t nat -A OUTPUT -j SHADOWSOCKS
+iptables -t nat -A SHADOWSOCKS -p tcp -m set ! ${MATCH_SET} china dst -j REDIRECT --to-ports ${SS_REDIR_LISTEN_PORT_BEGIN}-$((SS_REDIR_LISTEN_PORT_BEGIN+SS_REDIR_LISTEN_PORT_COUNT-1)) --random
+
+# UDP redirect
+modprobe xt_TPROXY
+
+SS_REDIR_LISTEN_PORT=${SS_REDIR_LISTEN_PORT_BEGIN}
+for l in ${locale}; do
+    conf_file=/jffs/shadowsocks/${l}.json
+
+    nohup ss-redir -c ${conf_file} -b ${SS_REDIR_LISTEN_ADDR} -l ${SS_REDIR_LISTEN_PORT} >/opt/var/log/ss-redir-${l}.log 2>&1 &
+    SS_REDIR_LISTEN_PORT=$((SS_REDIR_LISTEN_PORT+1))
+done
